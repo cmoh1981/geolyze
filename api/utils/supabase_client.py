@@ -33,40 +33,39 @@ def create_job(job_id: str, geo_id: str, user_id: str) -> dict:
         "geo_id": geo_id,
         "user_id": user_id,
         "status": "pending",
-        "progress": 0,
-        "message": "Job created",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    result = get_supabase().table("analysis_jobs").insert(row).execute()
+    result = get_supabase().table("jobs").insert(row).execute()
     return result.data[0] if result.data else row
 
 
 def update_job_status(
     job_id: str,
     status: str,
-    progress: int,
-    message: str,
     completed_at: Optional[str] = None,
+    error: Optional[str] = None,
 ) -> None:
-    """Update the status columns of an existing job."""
+    """Update the status columns of an existing job.
+
+    Only writes columns that actually exist on the jobs table:
+    status, completed_at, error.
+    """
     payload: dict[str, Any] = {
         "status": status,
-        "progress": progress,
-        "message": message,
     }
     if completed_at:
         payload["completed_at"] = completed_at
-    get_supabase().table("analysis_jobs").update(payload).eq("id", job_id).execute()
+    if error is not None:
+        payload["error"] = error
+    get_supabase().table("jobs").update(payload).eq("id", job_id).execute()
 
 
 def save_results(job_id: str, result_data: dict) -> None:
     """Persist full analysis results (plots, summary, metadata) to the job row."""
-    get_supabase().table("analysis_jobs").update(
+    get_supabase().table("jobs").update(
         {
             "result_data": result_data,
             "status": "completed",
-            "progress": 100,
-            "message": "Analysis complete",
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
     ).eq("id", job_id).execute()
@@ -74,11 +73,10 @@ def save_results(job_id: str, result_data: dict) -> None:
 
 def save_error(job_id: str, error_msg: str) -> None:
     """Record a failure on the job row."""
-    get_supabase().table("analysis_jobs").update(
+    get_supabase().table("jobs").update(
         {
             "status": "failed",
-            "progress": 0,
-            "message": error_msg,
+            "error": error_msg,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
     ).eq("id", job_id).execute()
@@ -87,7 +85,7 @@ def save_error(job_id: str, error_msg: str) -> None:
 def get_job(job_id: str) -> Optional[dict]:
     """Fetch a single job row by its ID."""
     result = (
-        get_supabase().table("analysis_jobs").select("*").eq("id", job_id).execute()
+        get_supabase().table("jobs").select("*").eq("id", job_id).execute()
     )
     return result.data[0] if result.data else None
 
@@ -98,7 +96,7 @@ def get_user_monthly_job_count(user_id: str) -> int:
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     result = (
         get_supabase()
-        .table("analysis_jobs")
+        .table("jobs")
         .select("id", count="exact")
         .eq("user_id", user_id)
         .gte("created_at", month_start.isoformat())
@@ -111,11 +109,11 @@ def get_user_tier(user_id: str) -> str:
     """Return the subscription tier for a user (defaults to 'free')."""
     result = (
         get_supabase()
-        .table("profiles")
-        .select("tier")
+        .table("users")
+        .select("plan")
         .eq("id", user_id)
         .execute()
     )
-    if result.data and result.data[0].get("tier"):
-        return result.data[0]["tier"]
+    if result.data and result.data[0].get("plan"):
+        return result.data[0]["plan"]
     return "free"

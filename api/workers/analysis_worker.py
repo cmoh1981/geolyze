@@ -194,7 +194,12 @@ def _safe_float(v: Any) -> float | None:
 
 
 def _update(job_id: str, status: str, progress: int, message: str) -> None:
-    """Update both Redis (fast reads) and Supabase (persistence)."""
+    """Update both Redis (fast reads) and Supabase (persistence).
+
+    Redis stores progress/message for real-time polling.
+    Supabase only stores status and completed_at (the jobs table
+    does not have progress or message columns).
+    """
     try:
         r = get_redis()
         update_status(r, job_id, status, progress, message)
@@ -205,7 +210,7 @@ def _update(job_id: str, status: str, progress: int, message: str) -> None:
         completed_at = (
             datetime.now(timezone.utc).isoformat() if status in ("completed", "failed") else None
         )
-        update_job_status(job_id, status, progress, message, completed_at)
+        update_job_status(job_id, status, completed_at=completed_at)
     except Exception:
         pass
 

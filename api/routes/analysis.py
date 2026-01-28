@@ -21,8 +21,6 @@ from utils.supabase_client import (
     get_user_monthly_job_count,
     get_user_tier,
 )
-from workers.analysis_worker import run_analysis
-
 router = APIRouter()
 
 # Rate-limit thresholds per tier
@@ -82,6 +80,8 @@ async def start_analysis(
         pass  # non-fatal
 
     # --- launch background worker ---
+    from workers.analysis_worker import run_analysis
+
     background_tasks.add_task(run_analysis, job_id, geo_id, user_id)
 
     return AnalyzeResponse(
@@ -134,8 +134,8 @@ async def get_job_status(
         m = cached["message"]
     else:
         s = job.get("status", "pending")
-        p = job.get("progress", 0)
-        m = job.get("message", "")
+        p = 100 if s == "completed" else 0
+        m = job.get("error", "") or ""
 
     return JobStatusResponse(
         job_id=job_id,
