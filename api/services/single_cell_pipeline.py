@@ -1,135 +1,231 @@
-"""Scanpy-based single-cell RNA-seq analysis pipeline."""
+"""Lightweight single-cell RNA-seq analysis pipeline using sklearn + umap-learn.
+
+Replaces scanpy/anndata to avoid heavy C-extension compilation on free hosting tiers.
+"""
 
 from __future__ import annotations
 
-import warnings
+import logging
 
-import anndata as ad
 import numpy as np
 import pandas as pd
-import scanpy as sc
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
-# Suppress non-critical scanpy / anndata warnings during pipeline runs
-warnings.filterwarnings("ignore", category=FutureWarning)
+logger = logging.getLogger(__name__)
 
 
 class SingleCellPipeline:
     """Full single-cell analysis: QC -> normalise -> HVG -> PCA -> UMAP -> clustering -> DE."""
 
-    def run(self, expression: pd.DataFrame) -> ad.AnnData:
-        """Execute the pipeline end-to-end and return a fully-annotated AnnData."""
+    def run(self, expression: pd.DataFrame) -> dict:
+        """Execute the pipeline end-to-end and return a results dict.
 
-        adata = self._build_anndata(expression)
-        adata = self._qc_filter(adata)
-        adata = self._normalise(adata)
-        adata = self._hvg_pca(adata)
-        adata = self._embed_cluster(adata)
-        adata = self._rank_genes(adata)
+        Args:
+            expression: genes (rows) x cells (columns) DataFrame
 
-        return adata
+        Returns:
+            dict with all analysis results
+        """
+        logger.info(f"Starting single-cell pipeline: {expression.shape}")
 
-    # ------------------------------------------------------------------
-    # Pipeline steps
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_anndata(expression: pd.DataFrame) -> ad.AnnData:
-        """Create AnnData from a genes-by-samples DataFrame (transpose so
-        obs = cells/samples, var = genes)."""
-        # GEOparse pivot gives genes-as-rows; scanpy wants cells-as-rows
-        mat = expression.T.copy()
+        # Transpose: we want cells as rows, genes as columns
+        # GEOparse pivot gives genes-as-rows; we need cells-as-rows
+        if expression.shape[0] < expression.shape[1]:
+            # More columns than rows -> rows are likely genes
+            data = expression.T.copy()
+        else:
+            data = expression.copy()
 
         # Ensure numeric
-        mat = mat.apply(pd.to_numeric, errors="coerce").fillna(0)
+        data = data.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-        adata = ad.AnnData(X=mat.values.astype(np.float32))
-        adata.obs_names = mat.index.astype(str)
-        adata.var_names = mat.columns.astype(str)
-        adata.var_names_make_unique()
-        adata.obs_names_make_unique()
+        result: dict = {
+            "n_cells_raw": data.shape[0],
+            "n_genes_raw": data.shape[1],
+        }
 
-        return adata
+        # ------------------------------------------------------------------
+        # Step 1: QC filtering
+        # ------------------------------------------------------------------
+        logger.info("Step 1: QC filtering")
+        genes_per_cell = (data > 0).sum(axis=1)
+        cells_per_gene = (data > 0).sum(axis=0)
 
-    @staticmethod
-    def _qc_filter(adata: ad.AnnData) -> ad.AnnData:
-        """Basic quality-control filtering."""
-        # Flag mitochondrial genes
-        adata.var["mt"] = adata.var_names.str.upper().str.startswith("MT-")
+        # Filter cells with at least 200 genes expressed (adaptive)
+        min_genes = min(200, int(data.shape[1] * 0.05))
+        cell_mask = genes_per_cell >= min_genes
+        data = data.loc[cell_mask]
 
-        sc.pp.calculate_qc_metrics(
-            adata, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True
-        )
+        # Filter genes expressed in at least 3 cells (adaptive)
+        min_cells = min(3, max(1, int(data.shape[0] * 0.01)))
+        # Recompute after cell filtering
+        cells_per_gene = (data > 0).sum(axis=0)
+        gene_mask = cells_per_gene >= min_cells
+        data = data.loc[:, gene_mask]
 
-        # Adaptive thresholds -- avoid wiping the entire dataset
-        min_genes = min(200, int(adata.n_vars * 0.05))
-        min_cells = min(3, max(1, int(adata.n_obs * 0.01)))
+        result["n_cells_filtered"] = data.shape[0]
+        result["n_genes_filtered"] = data.shape[1]
 
-        sc.pp.filter_cells(adata, min_genes=min_genes)
-        sc.pp.filter_genes(adata, min_cells=min_cells)
-
-        # Remove high-mito cells if we detected any MT genes
-        if adata.var["mt"].any():
-            pct_mito = adata.obs["pct_counts_mt"]
-            upper = min(pct_mito.quantile(0.95), 20)
-            adata = adata[pct_mito < upper].copy()
-
-        return adata
-
-    @staticmethod
-    def _normalise(adata: ad.AnnData) -> ad.AnnData:
-        """Total-count normalise to 1e4, then log1p."""
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-
-        # Keep raw counts for DE later
-        adata.raw = adata.copy()
-
-        return adata
-
-    @staticmethod
-    def _hvg_pca(adata: ad.AnnData) -> ad.AnnData:
-        """Select highly-variable genes and run PCA."""
-        n_hvg = min(2000, adata.n_vars)
-        if adata.n_vars > n_hvg:
-            sc.pp.highly_variable_genes(
-                adata, n_top_genes=n_hvg, flavor="seurat", subset=False
+        if data.shape[0] < 10 or data.shape[1] < 10:
+            raise ValueError(
+                f"Too few cells ({data.shape[0]}) or genes ({data.shape[1]}) after filtering"
             )
-        else:
-            adata.var["highly_variable"] = True
 
-        # PCA on HVG
-        n_pcs = min(50, adata.n_obs - 1, adata.n_vars - 1)
-        n_pcs = max(n_pcs, 2)  # need at least 2
-        sc.tl.pca(adata, n_comps=n_pcs, use_highly_variable=True)
+        # QC metrics
+        genes_per_cell_filtered = (data > 0).sum(axis=1)
+        result["genes_per_cell"] = genes_per_cell_filtered.tolist()
+        result["total_counts"] = data.sum(axis=1).tolist()
 
-        return adata
+        # ------------------------------------------------------------------
+        # Step 2: Normalize (CPM + log1p)
+        # ------------------------------------------------------------------
+        logger.info("Step 2: Normalizing")
+        row_sums = data.sum(axis=1)
+        row_sums = row_sums.replace(0, 1)
+        normalized = data.div(row_sums, axis=0) * 1e4
+        log_data = np.log1p(normalized)
 
-    @staticmethod
-    def _embed_cluster(adata: ad.AnnData) -> ad.AnnData:
-        """Compute neighbours, UMAP, and Leiden clustering."""
-        n_neighbors = min(15, adata.n_obs - 1)
-        n_neighbors = max(n_neighbors, 2)
-        n_pcs_use = min(adata.obsm["X_pca"].shape[1], 30)
+        # ------------------------------------------------------------------
+        # Step 3: Highly variable genes (top by variance)
+        # ------------------------------------------------------------------
+        logger.info("Step 3: Selecting variable genes")
+        gene_var = log_data.var(axis=0)
+        n_hvg = min(2000, log_data.shape[1])
+        hvg = gene_var.nlargest(n_hvg).index
+        log_data_hvg = log_data[hvg]
 
-        sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs_use)
-        sc.tl.umap(adata)
-        sc.tl.leiden(adata, flavor="igraph", n_iterations=2)
+        # ------------------------------------------------------------------
+        # Step 4: PCA
+        # ------------------------------------------------------------------
+        logger.info("Step 4: PCA")
+        n_components = min(50, log_data_hvg.shape[0] - 1, log_data_hvg.shape[1] - 1)
+        n_components = max(n_components, 2)
+        scaler = StandardScaler()
+        scaled = scaler.fit_transform(log_data_hvg.values)
+        pca = PCA(n_components=n_components)
+        pca_result = pca.fit_transform(scaled)
+        result["pca_embeddings"] = pca_result[:, :2].tolist()
+        result["pca_variance_ratio"] = pca.explained_variance_ratio_.tolist()
 
-        return adata
-
-    @staticmethod
-    def _rank_genes(adata: ad.AnnData) -> ad.AnnData:
-        """Rank genes per Leiden cluster (Wilcoxon)."""
-        if len(adata.obs["leiden"].unique()) < 2:
-            return adata  # need >= 2 groups
-
+        # ------------------------------------------------------------------
+        # Step 5: UMAP
+        # ------------------------------------------------------------------
+        logger.info("Step 5: UMAP")
+        n_pcs_use = min(30, n_components)
         try:
-            sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")
-        except Exception:
-            # Fall back to t-test if wilcoxon fails (e.g. very small groups)
-            try:
-                sc.tl.rank_genes_groups(adata, groupby="leiden", method="t-test")
-            except Exception:
-                pass
+            import umap
 
-        return adata
+            n_neighbors = min(15, pca_result.shape[0] - 1)
+            n_neighbors = max(n_neighbors, 2)
+            reducer = umap.UMAP(
+                n_components=2, n_neighbors=n_neighbors, random_state=42
+            )
+            umap_result = reducer.fit_transform(pca_result[:, :n_pcs_use])
+            result["umap_embeddings"] = umap_result.tolist()
+        except Exception as e:
+            logger.warning(f"UMAP failed: {e}, falling back to PCA 2D")
+            result["umap_embeddings"] = pca_result[:, :2].tolist()
+
+        # ------------------------------------------------------------------
+        # Step 6: Clustering (KMeans as lightweight Leiden alternative)
+        # ------------------------------------------------------------------
+        logger.info("Step 6: Clustering")
+        from sklearn.cluster import KMeans
+
+        n_clusters = min(max(2, int(np.sqrt(data.shape[0] / 10))), 20)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(pca_result[:, :n_pcs_use])
+        result["clusters"] = clusters.tolist()
+        result["n_clusters"] = int(n_clusters)
+        result["cell_names"] = data.index.tolist()
+
+        # ------------------------------------------------------------------
+        # Step 7: Marker genes (top DE genes per cluster via fold-change)
+        # ------------------------------------------------------------------
+        logger.info("Step 7: Finding marker genes")
+        from scipy import stats
+
+        marker_genes: dict[str, list[str]] = {}
+        de_records: list[dict] = []
+
+        for c in range(n_clusters):
+            cluster_mask = clusters == c
+            if cluster_mask.sum() < 2 or (~cluster_mask).sum() < 2:
+                continue
+
+            cluster_vals = log_data.loc[data.index[cluster_mask]]
+            other_vals = log_data.loc[data.index[~cluster_mask]]
+
+            cluster_means = cluster_vals.mean(axis=0)
+            other_means = other_vals.mean(axis=0)
+            fold_change = cluster_means - other_means
+
+            # Top 20 genes by fold change for marker list
+            top_genes = fold_change.nlargest(20).index.tolist()
+            marker_genes[str(c)] = top_genes
+
+            # DE records for the top genes
+            for gene in top_genes[:10]:
+                try:
+                    t_stat, p_val = stats.ttest_ind(
+                        cluster_vals[gene].values,
+                        other_vals[gene].values,
+                        equal_var=False,
+                    )
+                    de_records.append(
+                        {
+                            "cluster": str(c),
+                            "gene": gene,
+                            "log2fc": float(fold_change[gene]),
+                            "pvalue": float(p_val) if not np.isnan(p_val) else 1.0,
+                            "score": float(t_stat) if not np.isnan(t_stat) else 0.0,
+                        }
+                    )
+                except Exception:
+                    continue
+
+        result["marker_genes"] = marker_genes
+
+        # Add adjusted p-values to DE records
+        if de_records:
+            from statsmodels.stats.multitest import multipletests
+
+            pvals = [r["pvalue"] for r in de_records]
+            try:
+                _, adj_pvals, _, _ = multipletests(pvals, method="fdr_bh")
+                for i, r in enumerate(de_records):
+                    r["padj"] = float(adj_pvals[i])
+            except Exception:
+                for r in de_records:
+                    r["padj"] = r["pvalue"]
+
+        result["de_results"] = de_records
+
+        # ------------------------------------------------------------------
+        # Step 8: Gene names for heatmap
+        # ------------------------------------------------------------------
+        all_top: list[str] = []
+        for c_genes in marker_genes.values():
+            all_top.extend(c_genes[:5])
+        # Deduplicate preserving order
+        seen: set[str] = set()
+        unique_top: list[str] = []
+        for g in all_top:
+            if g not in seen:
+                seen.add(g)
+                unique_top.append(g)
+        unique_top = unique_top[:50]
+
+        result["top_gene_names"] = unique_top
+        if unique_top:
+            valid_genes = [g for g in unique_top if g in log_data.columns]
+            result["top_gene_expression"] = log_data[valid_genes].values.tolist()
+            result["top_gene_names"] = valid_genes
+        else:
+            result["top_gene_expression"] = []
+
+        logger.info(
+            f"Pipeline complete: {data.shape[0]} cells, {n_clusters} clusters"
+        )
+        return result

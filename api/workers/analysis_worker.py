@@ -1,6 +1,6 @@
 """Background worker that orchestrates the full GEO analysis pipeline.
 
-Heavy CPU work (scanpy, DE) is offloaded to a thread-pool executor so
+Heavy CPU work (sklearn, DE) is offloaded to a thread-pool executor so
 the async event loop stays responsive.
 """
 
@@ -96,14 +96,14 @@ def _run_pipeline_sync(job_id: str, geo_id: str) -> dict[str, Any]:
     _update(job_id, "analyzing", 35, f"Detected {data_type}. Running analysis pipeline...")
 
     # ------------------------------------------------------------------
-    # 3. Run pipeline
+    # 3. Run pipeline (returns plain dict now, not AnnData)
     # ------------------------------------------------------------------
     if data_type == "single_cell":
         pipeline = SingleCellPipeline()
-        adata = pipeline.run(data["expression"])
+        pipeline_result = pipeline.run(data["expression"])
     else:
         pipeline = BulkPipeline()
-        adata = pipeline.run(data["expression"], data.get("gse"))
+        pipeline_result = pipeline.run(data["expression"], data.get("gse"))
 
     _update(job_id, "analyzing", 75, "Analysis done. Generating visualisations...")
 
@@ -114,18 +114,17 @@ def _run_pipeline_sync(job_id: str, geo_id: str) -> dict[str, Any]:
     plots: dict[str, Any] = {}
 
     if data_type == "single_cell":
-        plots["umap"] = plotter.umap_plot(adata)
-        plots["qc_violin"] = plotter.qc_violin_plot(adata)
-        plots["heatmap"] = plotter.heatmap_top_genes(adata)
-        plots["pca_variance"] = plotter.pca_variance_plot(adata)
-        plots["dotplot"] = plotter.gene_expression_dotplot(adata)
+        plots["umap"] = plotter.umap_plot(pipeline_result)
+        plots["qc_violin"] = plotter.qc_violin_plot(pipeline_result)
+        plots["heatmap"] = plotter.heatmap_top_genes(pipeline_result)
+        plots["pca_variance"] = plotter.pca_variance_plot(pipeline_result)
+        if pipeline_result.get("top_gene_names"):
+            plots["dotplot"] = plotter.gene_expression_dotplot(pipeline_result)
     else:
-        plots["pca_variance"] = plotter.pca_variance_plot(adata)
-        plots["correlation"] = plotter.sample_correlation_heatmap(adata)
-        if "de_results" in getattr(adata, "uns", {}):
-            de_df = adata.uns["de_results"]
-            if isinstance(de_df, pd.DataFrame) and not de_df.empty:
-                plots["volcano"] = plotter.volcano_plot(de_df)
+        plots["pca_variance"] = plotter.pca_variance_plot(pipeline_result)
+        plots["correlation"] = plotter.sample_correlation_heatmap(pipeline_result)
+        if pipeline_result.get("de_results"):
+            plots["volcano"] = plotter.volcano_plot(pipeline_result["de_results"])
 
     _update(job_id, "analyzing", 90, "Building result summary...")
 
@@ -133,36 +132,45 @@ def _run_pipeline_sync(job_id: str, geo_id: str) -> dict[str, Any]:
     # 5. Summary statistics
     # ------------------------------------------------------------------
     summary: dict[str, Any] = {
-        "n_genes": int(adata.n_vars),
-        "n_samples": int(adata.n_obs),
         "data_type": data_type,
+        "n_genes": pipeline_result.get(
+            "n_genes_filtered", pipeline_result.get("n_genes_raw", 0)
+        ),
     }
-    if data_type == "single_cell" and "leiden" in adata.obs.columns:
-        summary["n_clusters"] = int(adata.obs["leiden"].nunique())
 
-    # ------------------------------------------------------------------
-    # 6. Serialise DE results
-    # ------------------------------------------------------------------
-    de_list: list[dict] | None = None
     if data_type == "single_cell":
-        de_list = _extract_sc_de_genes(adata)
-    elif "de_results" in getattr(adata, "uns", {}):
-        de_df = adata.uns["de_results"]
-        if isinstance(de_df, pd.DataFrame) and not de_df.empty:
-            de_list = (
-                de_df.head(100)
-                .replace({np.nan: None, np.inf: None, -np.inf: None})
-                .to_dict(orient="records")
-            )
+        summary["n_samples"] = pipeline_result.get("n_cells_filtered", 0)
+        summary["n_clusters"] = pipeline_result.get("n_clusters", 0)
+        summary["n_cells_raw"] = pipeline_result.get("n_cells_raw", 0)
+        summary["n_cells_filtered"] = pipeline_result.get("n_cells_filtered", 0)
+    else:
+        summary["n_samples"] = pipeline_result.get("n_samples", 0)
 
+    # ------------------------------------------------------------------
+    # 6. Build final result
+    # ------------------------------------------------------------------
     result: dict[str, Any] = {
         "plots": plots,
         "summary": summary,
         "metadata": data["metadata"],
         "data_type": data_type,
     }
-    if de_list is not None:
-        result["de_results"] = de_list
+
+    # Include DE results (already serialised as list of dicts)
+    de_results = pipeline_result.get("de_results")
+    if de_results:
+        # Sanitise NaN/Inf values
+        clean_de = []
+        for rec in de_results[:100]:
+            clean_rec = {}
+            for k, v in rec.items():
+                clean_rec[k] = _safe_float(v) if isinstance(v, float) else v
+            clean_de.append(clean_rec)
+        result["de_results"] = clean_de
+
+    # Include marker genes for single-cell
+    if pipeline_result.get("marker_genes"):
+        result["marker_genes"] = pipeline_result["marker_genes"]
 
     return result
 
@@ -170,37 +178,6 @@ def _run_pipeline_sync(job_id: str, geo_id: str) -> dict[str, Any]:
 # ======================================================================
 # Helpers
 # ======================================================================
-
-
-def _extract_sc_de_genes(adata, top_n: int = 20) -> list[dict] | None:
-    """Extract the top DE genes per cluster from scanpy's rank_genes_groups."""
-    if "rank_genes_groups" not in adata.uns:
-        return None
-
-    rgg = adata.uns["rank_genes_groups"]
-    groups = list(rgg["names"].dtype.names)
-
-    records: list[dict] = []
-    for group in groups:
-        names = rgg["names"][group][:top_n]
-        scores = rgg["scores"][group][:top_n]
-        pvals = rgg["pvals"][group][:top_n] if "pvals" in rgg else [None] * top_n
-        padj = rgg["pvals_adj"][group][:top_n] if "pvals_adj" in rgg else [None] * top_n
-        logfc = rgg["logfoldchanges"][group][:top_n] if "logfoldchanges" in rgg else [None] * top_n
-
-        for i in range(len(names)):
-            records.append(
-                {
-                    "cluster": str(group),
-                    "gene": str(names[i]),
-                    "score": _safe_float(scores[i]),
-                    "pvalue": _safe_float(pvals[i]),
-                    "padj": _safe_float(padj[i]),
-                    "log2fc": _safe_float(logfc[i]),
-                }
-            )
-
-    return records if records else None
 
 
 def _safe_float(v: Any) -> float | None:
