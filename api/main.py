@@ -1,10 +1,17 @@
 """GEOlyze API -- FastAPI application entry point."""
 
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from routes import analysis, health
+
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+logger = logging.getLogger("geolyze")
+logger.info("Starting GEOlyze API...")
 
 app = FastAPI(
     title="GEOlyze API",
@@ -24,3 +31,5 @@ app.add_middleware(
 # -- Routers --
 app.include_router(health.router, tags=["health"])
 app.include_router(analysis.router, prefix="/api", tags=["analysis"])
+
+logger.info("GEOlyze API ready - routes registered")
