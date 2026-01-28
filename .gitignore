@@ -1,0 +1,26 @@
+# Dependencies
+web/node_modules/
+api/__pycache__/
+api/**/__pycache__/
+*.pyc
+
+# Build
+web/.next/
+api/*.egg-info/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+api/data/
+*.h5ad
